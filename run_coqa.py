@@ -1,0 +1,730 @@
+# coding=utf-8
+# Copyright 2018 The Google AI Language Team Authors and The HuggingFace Inc. team.
+# Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Run BERT on CoQA."""
+
+from __future__ import absolute_import, division, print_function
+
+import argparse
+import logging
+import os
+import random
+import sys
+from io import open
+import json
+import code
+
+import numpy as np
+import torch
+import torch.nn as nn
+import tokenization
+from torch.nn import CrossEntropyLoss
+from torch.utils.data import (DataLoader, RandomSampler, SequentialSampler,
+                              TensorDataset)
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm, trange
+
+# from tensorboardX import SummaryWriter
+
+CONFIG_NAME = "config.json"
+WEIGHTS_NAME = "pytorch_model.bin"
+
+# from pytorch_pretrained_bert.file_utils import WEIGHTS_NAME, CONFIG_NAME
+from modeling import BertForCoQA
+from pytorch_pretrained_bert.optimization import BertAdam, WarmupLinearSchedule
+# from pytorch_pretrained_bert.tokenization import BertTokenizer 
+from pytorch_pretrained_bert.tokenization import whitespace_tokenize, BasicTokenizer, BertTokenizer
+
+from run_coqa_dataset_utils import read_coqa_examples, convert_examples_to_features, RawResult, write_predictions
+# from parallel import DataParallelCriterion, DataParallelModel, gather
+
+if sys.version_info[0] == 2:
+    import cPickle as pickle
+else:
+    import pickle
+
+logger = logging.getLogger(__name__)
+
+
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    ## Required parameters
+    parser.add_argument(
+        "--bert_model",
+        default="bert-base-uncased",
+        type=str,
+        required=True,
+        help="Bert pre-trained model selected in the list: bert-base-uncased, "
+        "bert-large-uncased, bert-base-cased, bert-large-cased, bert-base-multilingual-uncased, "
+        "bert-base-multilingual-cased, bert-base-chinese.")
+    parser.add_argument(
+        "--output_dir",
+        default="./output",
+        type=str,
+        required=True,
+        help=
+        "The output directory where the model checkpoints and predictions will be written."
+    )
+
+    ## Other parameters
+    parser.add_argument("--vocab_file", default='./model/bert-base-uncased-vocab.txt', type=str,
+                        help="The vocabulary file that the BERT model was trained on.")
+    parser.add_argument("--tokenizer_file", default='./tokenizer', type=str,
+                        help="The tokenizer file.")
+    parser.add_argument(
+        "--train_file",
+        default="./data/coqa-train-v1.0.json",
+        type=str,
+        help="CoQA json for training. E.g., coqa-train-v1.0.json")
+    parser.add_argument(
+        "--predict_file",
+        default="./data/coqa-dev-v1.0.json",
+        type=str,
+        help="CoQA json for predictions. E.g., coqa-dev-v1.1.json")
+    parser.add_argument(
+        "--max_seq_length",
+        default=450,
+        type=int,
+        help=
+        "The maximum total input sequence length after WordPiece tokenization. Sequences "
+        "longer than this will be truncated, and sequences shorter than this will be padded."
+    )
+    parser.add_argument(
+        "--doc_stride",
+        default=150,
+        type=int,
+        help=
+        "When splitting up a long document into chunks, how much stride to take between chunks."
+    )
+    parser.add_argument(
+        "--max_query_length",
+        default=75,
+        type=int,
+        help=
+        "The maximum number of tokens for the question. Questions longer than this will "
+        "be truncated to this length.")
+    parser.add_argument("--do_train",
+                        action='store_true',
+                        help="Whether to run training.")
+    parser.add_argument("--do_predict",
+                        action='store_true',
+                        help="Whether to run eval on the dev set.")
+    # parser.add_argument("--do_F1",
+    #                     action='store_true',
+    #                     help="Whether to calculating F1 score") # we don't talk anymore. please use official evaluation scripts
+    parser.add_argument("--train_batch_size",
+                        default=12,
+                        type=int,
+                        help="Total batch size for training.")
+    parser.add_argument("--predict_batch_size",
+                        default=12,
+                        type=int,
+                        help="Total batch size for predictions.")
+    parser.add_argument("--learning_rate",
+                        default=5e-5,
+                        type=float,
+                        help="The initial learning rate for Adam.")
+    parser.add_argument("--num_train_epochs",
+                        default=3.0,
+                        type=float,
+                        help="Total number of training epochs to perform.")
+    parser.add_argument(
+        "--warmup_proportion",
+        default=0.1,
+        type=float,
+        help=
+        "Proportion of training to perform linear learning rate warmup for. E.g., 0.1 = 10%% "
+        "of training.")
+    parser.add_argument(
+        "--n_best_size",
+        default=20,
+        type=int,
+        help=
+        "The total number of n-best predictions to generate in the nbest_predictions.json "
+        "output file.")
+    parser.add_argument(
+        "--max_answer_length",
+        default=30,
+        type=int,
+        help=
+        "The maximum length of an answer that can be generated. This is needed because the start "
+        "and end predictions are not conditioned on one another.")
+    parser.add_argument(
+        "--verbose_logging",
+        action='store_true',
+        help=
+        "If true, all of the warnings related to data processing will be printed. "
+        "A number of warnings are expected for a normal CoQA evaluation.")
+    parser.add_argument("--no_cuda",
+                        action='store_true',
+                        help="Whether not to use CUDA when available")
+    parser.add_argument("--cuda_visiable",
+                        type=str,
+                        default='0',
+                        help="which gpu to use")
+    parser.add_argument('--seed',
+                        type=int,
+                        default=42,
+                        help="random seed for initialization")
+    parser.add_argument(
+        '--gradient_accumulation_steps',
+        type=int,
+        default=1,
+        help=
+        "Number of updates steps to accumulate before performing a backward/update pass."
+    )
+    parser.add_argument(
+        "--do_lower_case",
+        action='store_true',
+        help=
+        "Whether to lower case the input text. True for uncased models, False for cased models."
+    )
+    parser.add_argument("--local_rank",
+                        type=int,
+                        default=-1,
+                        help="local_rank for distributed training on gpus")
+    parser.add_argument(
+        '--fp16',
+        action='store_true',
+        help="Whether to use 16-bit float precision instead of 32-bit")
+    parser.add_argument('--overwrite_output_dir',
+                        action='store_true',
+                        help="Overwrite the content of the output directory")
+    parser.add_argument(
+        '--loss_scale',
+        type=float,
+        default=0,
+        help=
+        "Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
+        "0 (default value): dynamic loss scaling.\n"
+        "Positive power of 2: static loss scaling value.\n")
+    parser.add_argument(
+        '--null_score_diff_threshold',
+        type=float,
+        default=0.0,
+        help=
+        "If null_score - best_non_null is greater than the threshold predict null."
+    )
+    parser.add_argument('--server_ip',
+                        type=str,
+                        default='',
+                        help="Can be used for distant debugging.")
+    parser.add_argument('--server_port',
+                        type=str,
+                        default='',
+                        help="Can be used for distant debugging.")
+    parser.add_argument('--logfile',
+                        type=str,
+                        default=None,
+                        help='Which file to keep log.')
+    parser.add_argument('--logmode',
+                        type=str,
+                        default=None,
+                        help='logging mode, `w` or `a`')
+    parser.add_argument('--wordrop_rate',
+                        type=float,
+                        default=0.,
+                        help='rate of wordrop')
+    parser.add_argument('--no_tensorboard',
+                        action='store_true',
+                        help='no tensor board')
+    parser.add_argument('--qa_tag',
+                        action='store_true',
+                        help='add qa tag or not')
+    parser.add_argument('--history_len',
+                        type=int,
+                        default=2,
+                        help='length of history')
+    args = parser.parse_args()
+    print(args)
+    
+
+    # 远程调试
+    if args.server_ip and args.server_port:
+        # Distant debugging - see https://code.visualstudio.com/docs/python/debugging#_attach-to-a-local-script
+        import ptvsd
+        print("Waiting for debugger attach")
+        ptvsd.enable_attach(address=(args.server_ip, args.server_port),
+                            redirect_output=True)
+        ptvsd.wait_for_attach()
+
+    # 判断是否能使用GPU
+    if args.local_rank == -1 or args.no_cuda:
+        os.environ['CUDA_VISIBLE_DEVICES'] = args.cuda_visiable
+        device = torch.device("cuda" if torch.cuda.is_available()
+                              and not args.no_cuda else "cpu")
+        n_gpu = torch.cuda.device_count()
+    else:
+        torch.cuda.set_device(args.local_rank)
+        device = torch.device("cuda", args.local_rank)
+        n_gpu = 1
+        # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
+        torch.distributed.init_process_group(backend='nccl')
+
+    # 基础的Bert配置
+    logging.basicConfig(
+        format='%(asctime)s - %(levelname)s - %(name)s -   %(message)s',
+        datefmt='%m/%d/%Y %H:%M:%S',
+        level=logging.INFO if args.local_rank in [-1, 0] else logging.WARN,
+        filename=args.logfile,
+        filemode=args.logmode)
+
+    # 打印日志信息
+    logger.info(
+        "device: {} n_gpu: {}, distributed training: {}, 16-bits training: {}".
+        format(device, n_gpu, bool(args.local_rank != -1), args.fp16))
+
+    # 
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError(
+            "Invalid gradient_accumulation_steps parameter: {}, should be >= 1"
+            .format(args.gradient_accumulation_steps))
+
+    # batch_size
+    args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if n_gpu > 0:
+        torch.cuda.manual_seed_all(args.seed)
+
+    if not args.do_train and not args.do_predict and not args.do_F1:
+        raise ValueError(
+            "At least one of `do_train` or `do_predict` or `do_F1` must be True."
+        )
+
+    if args.do_train:
+        if not args.train_file:
+            raise ValueError(
+                "If `do_train` is True, then `train_file` must be specified.")
+    if args.do_predict:
+        if not args.predict_file:
+            raise ValueError(
+                "If `do_predict` is True, then `predict_file` must be specified."
+            )
+
+    if os.path.exists(args.output_dir) and os.listdir(
+            args.output_dir
+    ) and args.do_train and not args.overwrite_output_dir:
+        raise ValueError(
+            "Output directory () already exists and is not empty.")
+    if not os.path.exists(args.output_dir):
+        os.makedirs(args.output_dir)
+
+    if args.local_rank not in [-1, 0]:
+        torch.distributed.barrier(
+        )  # Make sure only the first process in distributed training will download model & vocab
+
+    if args.do_train or args.do_predict:
+        # tokenizer = BertTokenizer.from_pretrained(args.bert_model, do_lower_case=args.do_lower_case)
+        # 声明方法
+        tokenizer = tokenization.FullTokenizer(vocab_file=args.vocab_file, do_lower_case=args.do_lower_case)
+        model = BertForCoQA.from_pretrained(args.bert_model,mask_p=args.wordrop_rate)
+        # for i in model.named_parameters():
+        #     print("--",i[0])
+        # guofeng
+        
+        if args.local_rank == 0:
+            torch.distributed.barrier()
+
+        if args.fp16:
+            model.half()
+        # 这行代码的意思是将所有最开始读取数据时的tensor变量copy一份到device所指定的GPU上去，之后的运算都在GPU上进行
+        model.to(device)
+        if args.local_rank != -1: # False
+            model = torch.nn.parallel.DistributedDataParallel(
+                model,
+                device_ids=[args.local_rank],
+                output_device=args.local_rank,
+                find_unused_parameters=True)
+        elif n_gpu > 1: # False
+            model = torch.nn.DataParallel(model)
+            # model = DataParallelModel(model)
+        
+    if args.do_train:
+        # if args.local_rank in [-1, 0] and not args.no_tensorboard:
+            # tb_writer = SummaryWriter()
+        # Prepare data loader
+        cached_train_features_file = args.train_file + '_{0}_{1}_{2}_{3}_{4}_{5}'.format(
+            list(filter(None, args.bert_model.split('/'))).pop(),
+            str(args.max_seq_length), str(args.doc_stride),
+            str(args.max_query_length), str(args.history_len), str(
+                args.qa_tag))
+        print("\n\n cached_train_features_file:", cached_train_features_file, "\n\n")  #  './data/coqa-train-v1.0.json_model_450_150_75_2_False'
+        cached_train_examples_file = args.train_file + '_examples_{0}_{1}.pk'.format(
+            str(args.history_len), str(args.qa_tag))
+        print("\n\n cached_train_examples_file:", cached_train_examples_file, "\n\n") # './data/coqa-train-v1.0.json_examples_2_False.pk'
+
+        
+        # try train_examples
+        try:
+            with open(cached_train_examples_file, "rb") as reader:
+                train_examples = pickle.load(reader)
+
+        except:
+            logger.info("  No cached file %s", cached_train_examples_file)
+            train_examples = read_coqa_examples(input_file=args.train_file,
+                                                history_len=args.history_len,
+                                                add_QA_tag=args.qa_tag)
+            
+            if args.local_rank == -1 or torch.distributed.get_rank() == 0:
+                logger.info("  Saving train examples into cached file %s",
+                            cached_train_examples_file)
+                with open(cached_train_examples_file, "wb") as writer:
+                    pickle.dump(train_examples, writer)
+
+
+        # try train_features
+        try:
+            with open(cached_train_features_file, "rb") as reader:
+                train_features = pickle.load(reader)
+
+        except:
+            logger.info("  No cached file %s", cached_train_features_file)
+    
+            train_features = convert_examples_to_features(
+                examples=train_examples,
+                tokenizer=tokenizer,
+                max_seq_length=args.max_seq_length,
+                doc_stride=args.doc_stride,
+                max_query_length=args.max_query_length,
+            )
+            if args.local_rank == -1 or torch.distributed.get_rank() == 0:
+                logger.info("  Saving train features into cached file %s",  # './data/coqa-train-v1.0.json_model_384_128_64_2_False'
+                            cached_train_features_file)
+                with open(cached_train_features_file, "wb") as writer:
+                    pickle.dump(train_features, writer)
+        
+        # 将feature转换为tensor
+        all_input_ids = torch.tensor([f.input_ids for f in train_features],
+                                     dtype=torch.long)  # [163633,384]     正文内容含padding
+        all_input_mask = torch.tensor([f.input_mask for f in train_features],
+                                      dtype=torch.long) # [163633,384]     1表示正文 0表示padding
+        all_segment_ids = torch.tensor([f.segment_ids for f in train_features],
+                                       dtype=torch.long) # [163633,384]    0问题 1正文 0padding
+        all_start_positions = torch.tensor(
+            [f.start_position for f in train_features], dtype=torch.long)  # [163633]  起始位置
+        all_end_positions = torch.tensor(
+            [f.end_position for f in train_features], dtype=torch.long)    # [163633]  终止位置
+        all_cls_idx = torch.tensor([f.cls_idx for f in train_features],    # [163633]  3
+                                   dtype=torch.long)
+        train_data = TensorDataset(all_input_ids, all_input_mask,
+                                   all_segment_ids, all_start_positions,
+                                   all_end_positions, all_cls_idx)
+
+        if args.local_rank == -1: # True
+            train_sampler = RandomSampler(train_data) # 随机抽样
+        else:
+            train_sampler = DistributedSampler(train_data)
+
+        train_dataloader = DataLoader(train_data,
+                                      sampler=train_sampler,
+                                      batch_size=args.train_batch_size) # 必须的dataloader
+
+        num_train_optimization_steps = len(
+            train_dataloader
+        ) // args.gradient_accumulation_steps * args.num_train_epochs  #15342
+        # if args.local_rank != -1:
+        #     num_train_optimization_steps = num_train_optimization_steps // torch.distributed.get_world_size()
+
+        # Prepare optimizer
+        param_optimizer = list(model.named_parameters())
+
+        # hack to remove pooler, which is not used
+        # thus it produce None grad that break apex
+        # param_optimizer = [n for n in param_optimizer if 'pooler' not in n[0]]  不明白不用pooler
+
+        no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [{
+            'params': [
+                p for n, p in param_optimizer
+                if not any(nd in n for nd in no_decay)
+            ],
+            'weight_decay':
+            0.01
+        }, {
+            'params':
+            [p for n, p in param_optimizer if any(nd in n for nd in no_decay)],
+            'weight_decay':
+            0.0
+        }]
+
+        if args.fp16:
+            try:
+                from apex.optimizers import FP16_Optimizer
+                from apex.optimizers import FusedAdam
+            except ImportError:
+                raise ImportError(
+                    "Please install apex from https://www.github.com/nvidia/apex to use distributed and fp16 training."
+                )
+
+            optimizer = FusedAdam(optimizer_grouped_parameters,
+                                  lr=args.learning_rate,
+                                  bias_correction=False,
+                                  max_grad_norm=1.0)
+            if args.loss_scale == 0:
+                optimizer = FP16_Optimizer(optimizer, dynamic_loss_scale=True)
+            else:
+                optimizer = FP16_Optimizer(optimizer,
+                                           static_loss_scale=args.loss_scale)
+            warmup_linear = WarmupLinearSchedule(
+                warmup=args.warmup_proportion,
+                t_total=num_train_optimization_steps)
+        else:
+            optimizer = BertAdam(optimizer_grouped_parameters,  # True
+                                 lr=args.learning_rate,
+                                 warmup=args.warmup_proportion,
+                                 t_total=num_train_optimization_steps)
+
+        global_step = 0
+
+        logger.info("***** Running training *****")
+        logger.info("  Num orig examples = %d", len(train_examples))
+        logger.info("  Num split examples = %d", len(train_features))
+        logger.info("  Batch size = %d", args.train_batch_size)
+        logger.info("  Num steps = %d", num_train_optimization_steps)
+
+        model.train()
+        for epoch in trange(int(args.num_train_epochs), desc="Epoch"):
+            for step, batch in enumerate(
+                    tqdm(train_dataloader,
+                         desc="Iteration",
+                         disable=args.local_rank not in [-1, 0])):
+                if n_gpu == 1:
+                    batch = tuple(
+                        t.to(device)
+                        for t in batch)  # multi-gpu does scattering it-self
+                input_ids, input_mask, segment_ids, start_positions, end_positions, cls_idx = batch
+                loss = model(input_ids, segment_ids, input_mask,
+                             start_positions, end_positions, cls_idx) # 这里关键了 调用到了BertForCoQA.forward的函数中
+
+                # loss = gather(loss, 0)
+                if n_gpu > 1:
+                    loss = loss.mean()  # mean() to average on multi-gpu.
+                if args.gradient_accumulation_steps > 1:
+                    loss = loss / args.gradient_accumulation_steps
+
+                if args.fp16:
+                    optimizer.backward(loss)
+                else:
+                    loss.backward()
+
+                if (step + 1) % args.gradient_accumulation_steps == 0:
+                    if args.fp16:
+                        # modify learning rate with special warm up BERT uses
+                        # if args.fp16 is False, BertAdam is used and handles this automatically
+                        lr_this_step = args.learning_rate * warmup_linear.get_lr(
+                            global_step, args.warmup_proportion)
+                        for param_group in optimizer.param_groups:
+                            param_group['lr'] = lr_this_step
+                    optimizer.step()
+                    optimizer.zero_grad()
+                    global_step += 1
+                    if args.local_rank in [-1, 0]:
+                        # if not args.fp16 and not args.no_tensorboard:
+                        #     tb_writer.add_scalar('lr',
+                        #                          optimizer.get_lr()[0],
+                        #                          global_step)
+                        # if not args.no_tensorboard:
+                        #     tb_writer.add_scalar('loss', loss.item(),
+                        #                          global_step)
+                        if global_step % 100 == 0:
+                            logger.info(
+                                "Step: {}\tLearning rate: {}\tLoss: {}\t".
+                                format(
+                                    global_step,
+                                    optimizer.get_lr()[0]
+                                    if not args.fp16 else 'unknown',
+                                    loss.item() *
+                                    args.gradient_accumulation_steps))
+                    # code.interact(local=locals())
+                
+    
+    if args.do_train and (args.local_rank == -1
+                          or torch.distributed.get_rank() == 0):
+        # Save a trained model, configuration and tokenizer
+        model_to_save = model.module if hasattr(
+            model, 'module') else model  # Only save the model it-self
+
+        # If we save using the predefined names, we can load using `from_pretrained`
+        output_model_file = os.path.join(args.output_dir, WEIGHTS_NAME) # './output\\pytorch_model.bin'
+        output_config_file = os.path.join(args.output_dir, CONFIG_NAME) # './output\\config.json'
+        
+        # 保存模型：保存模型参数：保存词表
+        torch.save(model_to_save.state_dict(), output_model_file) # './output\\pytorch_model.bin'
+        model_to_save.config.to_json_file(output_config_file) # './output\\config.json'
+        tokenizer.save_vocabulary(args.tokenizer_file) # './tokenizer/vocab.txt'
+        
+        # Load a trained model and vocabulary that you have fine-tuned 
+        # 重新加载模型和tokenizer，使用的是训练好的模型和tokenizer
+        model = BertForCoQA.from_pretrained(args.output_dir)
+        # tokenizer = BertTokenizer.from_pretrained(
+        #     args.output_dir, do_lower_case=args.do_lower_case)
+        tokenizer = tokenization.FullTokenizer(
+        vocab_file='./tokenizer/vocab.txt', do_lower_case=args.do_lower_case)
+
+        # Good practice: save your training arguments together with the trained model
+        output_args_file = os.path.join(args.output_dir, 'training_args.bin') # './output\\training_args.bin'
+        torch.save(args, output_args_file) # 保存模型的参数
+        # code.interact(local=locals())
+    else:
+        model = BertForCoQA.from_pretrained(args.bert_model)
+
+    # code.interact(local=locals())
+    model.to(device)
+
+    if args.do_predict and (args.local_rank == -1
+                            or torch.distributed.get_rank() == 0):
+        # 声明predict的路径名
+        bert_type = 'bert-base-uncased' if model.config.hidden_size == 768 else 'bert-large-uncased'
+        cached_eval_features_file = args.predict_file + '_{0}_{1}_{2}_{3}_{4}_{5}'.format(
+            bert_type, str(args.max_seq_length), str(args.doc_stride),
+            str(args.max_query_length), str(args.history_len), str(
+                args.qa_tag)) # './data/coqa-dev-v1.0.json_bert-base-uncased_384_128_64_2_False'
+        cached_eval_examples_file = args.predict_file + '_examples_{0}_{1}.pk'.format(
+            str(args.history_len), str(args.qa_tag)) # './data/coqa-dev-v1.0.json_examples_2_False.pk'
+
+        
+        # try eval_examples
+        # 构建example
+        try:
+            with open(cached_eval_examples_file, 'rb') as reader:
+                eval_examples = pickle.load(reader)
+        except:
+            logger.info("No cached file: %s", cached_eval_examples_file)
+            eval_examples = read_coqa_examples(input_file=args.predict_file,
+                                               history_len=args.history_len,
+                                               add_QA_tag=args.qa_tag)
+            logger.info("  Saving eval examples into cached file %s",
+                        cached_eval_examples_file)
+            with open(cached_eval_examples_file, 'wb') as writer:
+                pickle.dump(eval_examples, writer)
+
+        # try eval_features
+        # 将examples 转化为features
+        try:
+            with open(cached_eval_features_file, "rb") as reader:
+                eval_features = pickle.load(reader)
+        except:
+            logger.info("No cached file: %s", cached_eval_features_file)
+            eval_features = convert_examples_to_features(
+                examples=eval_examples,
+                tokenizer=tokenizer,
+                max_seq_length=args.max_seq_length,
+                doc_stride=args.doc_stride,
+                max_query_length=args.max_query_length,
+            )
+            logger.info("  Saving eval features into cached file %s",
+                        cached_eval_features_file)
+            with open(cached_eval_features_file, "wb") as writer:
+                pickle.dump(eval_features, writer)
+
+        logger.info("***** Running predictions *****")
+        logger.info("  Num orig examples = %d", len(eval_examples))
+        logger.info("  Num split examples = %d", len(eval_features))
+        logger.info("  Batch size = %d", args.predict_batch_size)
+
+        # 转换为tensor
+        all_input_ids = torch.tensor([f.input_ids for f in eval_features],
+                                     dtype=torch.long)
+        all_input_mask = torch.tensor([f.input_mask for f in eval_features],
+                                      dtype=torch.long)
+        all_segment_ids = torch.tensor([f.segment_ids for f in eval_features],
+                                       dtype=torch.long)
+        all_example_index = torch.arange(all_input_ids.size(0),
+                                         dtype=torch.long)
+        eval_data = TensorDataset(all_input_ids, all_input_mask,
+                                  all_segment_ids, all_example_index)
+
+        # Run prediction for full data
+        eval_sampler = SequentialSampler(eval_data) # 顺序对数据集采样
+        eval_dataloader = DataLoader(eval_data,
+                                     sampler=eval_sampler,
+                                     batch_size=args.predict_batch_size)
+        
+        model.eval()
+        all_results = []
+        logger.info("Start evaluating")
+
+        for input_ids, input_mask, segment_ids, example_indices in tqdm(
+                eval_dataloader,
+                desc="Evaluating",
+                disable=args.local_rank not in [-1, 0]):
+            # if len(all_results) % 1000 == 0:
+            #     logger.info("Processing example: %d" % (len(all_results)))
+            input_ids = input_ids.to(device)
+            input_mask = input_mask.to(device)
+            segment_ids = segment_ids.to(device)
+            with torch.no_grad():
+                batch_start_logits, batch_end_logits, batch_cls_logits = model(input_ids, segment_ids, input_mask)
+            for i, example_index in enumerate(example_indices):
+                start_logits = batch_start_logits[i].detach().cpu().tolist()
+                end_logits = batch_end_logits[i].detach().cpu().tolist()
+                cls_logits = batch_cls_logits[i].detach().cpu().tolist()
+                eval_feature = eval_features[example_index.item()]
+                unique_id = int(eval_feature.unique_id)
+                # code.interact(local=locals())
+                all_results.append(
+                    RawResult(unique_id=unique_id,
+                              start_logits=start_logits,
+                              end_logits=end_logits,
+                              cls_logits=cls_logits))
+
+
+        output_prediction_file = os.path.join(args.output_dir,
+                                              "predictions.json") # 
+        output_nbest_file = os.path.join(args.output_dir,
+                                         "nbest_predictions.json")
+        output_null_log_odds_file = os.path.join(args.output_dir,
+                                                 "null_odds.json")
+        
+        write_predictions(eval_examples, eval_features, all_results,
+                          args.n_best_size, args.max_answer_length,
+                          args.do_lower_case, output_prediction_file,
+                          output_nbest_file, output_null_log_odds_file,
+                          args.verbose_logging, args.null_score_diff_threshold)
+        # code.interact(local=locals())
+
+    # we don't do F1 any more
+
+    # if args.do_F1 and (args.local_rank == -1
+    #                    or torch.distributed.get_rank() == 0):
+    #     logger.info("Start calculating F1")
+    #     cached_eval_examples_file = args.predict_file + '_examples.pk'
+    #     try:
+    #         with open(cached_eval_examples_file, 'rb') as reader:
+    #             eval_examples = pickle.load(reader)
+    #     except:
+    #         eval_examples = read_coqa_examples(input_file=args.predict_file)
+    #     pred_dict = json.load(
+    #         open(os.path.join(args.output_dir, "predictions.json"), 'rb'))
+    #     truth_dict = {}
+    #     for i in range(len(eval_examples)):
+    #         answers = eval_examples[i].additional_answers
+    #         tmp = eval_examples[i].orig_answer_text
+    #         if tmp not in answers:
+    #             answers.append(tmp)
+    #         truth_dict[eval_examples[i].qas_id] = answers
+    #     with open(os.path.join(args.output_dir, "truths.json"), 'w') as writer:
+    #         writer.write(json.dumps(truth_dict, indent=4) + '\n')
+    #     result, all_f1s = score(pred_dict, truth_dict)
+    #     logger.info(str(result))
+
+
+if __name__ == "__main__":
+    main()
